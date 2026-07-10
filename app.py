@@ -57,15 +57,31 @@ OVERPASS_MIRRORS = [
 ]
 
 
-@st.cache_data(show_spinner=False)
-def find_real_nearby_facilities(lat, lon, osm_filter, radius=3000):
+def _classify(tags):
+    """Overpass 요소의 태그를 보고 병원/경찰서/대피소 중 어디에 해당하는지 판정"""
+    if tags.get("amenity") == "hospital":
+        return "hospital"
+    if tags.get("amenity") == "police":
+        return "police"
+    if tags.get("emergency") == "assembly_point":
+        return "shelter"
+    return None
+
+
+@st.cache_data(show_spinner=False, ttl=300)  # 실패 결과가 오래 캐싱되지 않도록 5분 TTL
+def find_all_nearby_facilities(lat, lon, radius=3000):
+    """병원/경찰서/대피소를 단 한 번의 Overpass 요청으로 동시에 조회 (요청 수 최소화)"""
     query = f"""
-    [out:json][timeout:20];
+    [out:json][timeout:25];
     (
-      node[{osm_filter}](around:{radius},{lat},{lon});
-      way[{osm_filter}](around:{radius},{lat},{lon});
+      node["amenity"="hospital"](around:{radius},{lat},{lon});
+      way["amenity"="hospital"](around:{radius},{lat},{lon});
+      node["amenity"="police"](around:{radius},{lat},{lon});
+      way["amenity"="police"](around:{radius},{lat},{lon});
+      node["emergency"="assembly_point"](around:{radius},{lat},{lon});
+      way["emergency"="assembly_point"](around:{radius},{lat},{lon});
     );
-    out center;
+    out center tags;
     """
     headers = {
         "User-Agent": "DisasterSafetyApp/1.0 (contact: streamlit-app-demo@example.com)",
@@ -74,15 +90,21 @@ def find_real_nearby_facilities(lat, lon, osm_filter, radius=3000):
         "Content-Type": "text/plain; charset=utf-8",
     }
 
+    grouped = {"hospital": [], "police": [], "shelter": []}
     last_error = None
+
     for url in OVERPASS_MIRRORS:
         try:
             req = urllib.request.Request(url, data=query.encode('utf-8'), headers=headers)
-            with urllib.request.urlopen(req, timeout=20) as response:
+            with urllib.request.urlopen(req, timeout=25) as response:
                 data = json.loads(response.read().decode())
-            results = []
+
             for el in data.get("elements", []):
-                name = el.get("tags", {}).get("name", "이름 미상 시설")
+                tags = el.get("tags", {})
+                kind = _classify(tags)
+                if not kind:
+                    continue
+                name = tags.get("name", "이름 미상 시설")
                 if el["type"] == "node":
                     flat, flon = el["lat"], el["lon"]
                 else:
@@ -90,14 +112,15 @@ def find_real_nearby_facilities(lat, lon, osm_filter, radius=3000):
                     if not center:
                         continue
                     flat, flon = center["lat"], center["lon"]
-                results.append({"이름": name, "위도": flat, "경도": flon})
-            return results  # 성공하면 즉시 반환, 결과가 비어있어도 정상 응답이므로 반환
+                grouped[kind].append({"이름": name, "위도": flat, "경도": flon})
+
+            return grouped["hospital"], grouped["police"], grouped["shelter"]  # 성공 시 즉시 반환
         except Exception as e:
             last_error = e
             continue  # 이 미러가 실패하면 다음 미러로 재시도
 
-    st.warning(f"실시간 시설 조회 실패 ({osm_filter}): 모든 서버 응답 실패 - {last_error}")
-    return []
+    st.warning(f"실시간 시설 조회 실패: 모든 서버 응답 실패 - {last_error}")
+    return [], [], []
 
 
 def find_closest(user_lat, user_lon, facilities):
@@ -219,7 +242,7 @@ if address:
 
         if st.button("평가하기", type="primary"):
             scores = evaluate_comprehensive_safety(structure, int(year), int(floors), elevation, slope, river_dist)
-            grade, before, after = predict_earthquake_scenario(scores["지진점수"])
+            grade, before, after = predict_earthquake_scenario(scores["종합점수"])
 
             st.subheader("📊 평가 결과")
             c1, c2, c3 = st.columns(3)
@@ -232,10 +255,8 @@ if address:
             st.write(f"**지진 시 상황 예측**: {after}")
 
             st.subheader("🏃 주변 구호 기관 (실제 OSM 데이터 기반)")
-            with st.spinner("주변 병원/경찰서 실시간 조회 중..."):
-                hospitals = find_real_nearby_facilities(lat, lon, "amenity=hospital")
-                police = find_real_nearby_facilities(lat, lon, "amenity=police")
-                shelters = find_real_nearby_facilities(lat, lon, "emergency=assembly_point")
+            with st.spinner("주변 병원/경찰서/대피소 실시간 조회 중..."):
+                hospitals, police, shelters = find_all_nearby_facilities(lat, lon)
 
             closest_hospital = find_closest(lat, lon, hospitals)
             closest_police = find_closest(lat, lon, police)
