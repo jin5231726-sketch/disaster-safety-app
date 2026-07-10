@@ -105,7 +105,7 @@ def find_all_nearby_facilities(lat, lon, radius=3000):
     try:
         shelters = _kakao_keyword_search("대피소", lat, lon, radius)
     except Exception as e:
-        st.warning(f"대피소 조회 실패: {e}")
+        #st.warning(f"대피소 조회 실패: {e}")
 
     return hospitals, police, shelters
 
