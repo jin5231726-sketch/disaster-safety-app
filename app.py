@@ -95,18 +95,18 @@ def find_all_nearby_facilities(lat, lon, radius=3000):
     try:
         hospitals = _kakao_category_search("HP8", lat, lon, radius)
     except Exception as e:
-        pass
+        st.error(f"병원 검색 실패 원인: {e}")
 
     try:
         police = _kakao_category_search("PO3", lat, lon, radius)
     except Exception as e:
-        pass
+        st.error(f"경찰서 검색 실패 원인: {e}")
 
     try:
         shelters = _kakao_keyword_search("대피소", lat, lon, radius)
     except Exception as e:
-        pass
-
+        st.error(f"대피소 검색 실패 원인: {e}")
+        
     return hospitals, police, shelters
 
 
