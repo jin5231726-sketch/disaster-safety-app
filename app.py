@@ -48,36 +48,56 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(min(1, math.sqrt(a)))
 
 
+# overpass-api.de 원서버가 최근 봇 트래픽 방어로 요청을 자주 튕겨내므로(406 에러),
+# 헤더를 제대로 채우고 안 되면 다른 미러 서버로 순서대로 재시도한다.
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+]
+
+
 @st.cache_data(show_spinner=False)
 def find_real_nearby_facilities(lat, lon, osm_filter, radius=3000):
     query = f"""
-    [out:json][timeout:15];
+    [out:json][timeout:20];
     (
       node[{osm_filter}](around:{radius},{lat},{lon});
       way[{osm_filter}](around:{radius},{lat},{lon});
     );
     out center;
     """
-    url = "https://overpass-api.de/api/interpreter"
-    try:
-        req = urllib.request.Request(url, data=query.encode('utf-8'), headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=20) as response:
-            data = json.loads(response.read().decode())
-        results = []
-        for el in data.get("elements", []):
-            name = el.get("tags", {}).get("name", "이름 미상 시설")
-            if el["type"] == "node":
-                flat, flon = el["lat"], el["lon"]
-            else:
-                center = el.get("center")
-                if not center:
-                    continue
-                flat, flon = center["lat"], center["lon"]
-            results.append({"이름": name, "위도": flat, "경도": flon})
-        return results
-    except Exception as e:
-        st.warning(f"실시간 시설 조회 실패 ({osm_filter}): {e}")
-        return []
+    headers = {
+        "User-Agent": "DisasterSafetyApp/1.0 (contact: streamlit-app-demo@example.com)",
+        "Accept": "application/json, */*",
+        "Accept-Encoding": "identity",
+        "Content-Type": "text/plain; charset=utf-8",
+    }
+
+    last_error = None
+    for url in OVERPASS_MIRRORS:
+        try:
+            req = urllib.request.Request(url, data=query.encode('utf-8'), headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as response:
+                data = json.loads(response.read().decode())
+            results = []
+            for el in data.get("elements", []):
+                name = el.get("tags", {}).get("name", "이름 미상 시설")
+                if el["type"] == "node":
+                    flat, flon = el["lat"], el["lon"]
+                else:
+                    center = el.get("center")
+                    if not center:
+                        continue
+                    flat, flon = center["lat"], center["lon"]
+                results.append({"이름": name, "위도": flat, "경도": flon})
+            return results  # 성공하면 즉시 반환, 결과가 비어있어도 정상 응답이므로 반환
+        except Exception as e:
+            last_error = e
+            continue  # 이 미러가 실패하면 다음 미러로 재시도
+
+    st.warning(f"실시간 시설 조회 실패 ({osm_filter}): 모든 서버 응답 실패 - {last_error}")
+    return []
 
 
 def find_closest(user_lat, user_lon, facilities):
