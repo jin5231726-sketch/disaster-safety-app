@@ -36,7 +36,8 @@ def get_automated_elevation(lat, lon):
 
 
 # -----------------------------
-# 3. 실제 주변 시설(병원/경찰서/대피소) 카카오 로컬 API 조회
+# 3. 실제 주변 시설(병원/경찰서) OSM Overpass API 조회
+#    geopandas 없이 순수 파이썬 하버사인 거리 계산으로 대체 (배포 단순화)
 # -----------------------------
 def haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0  # 지구 반지름(m)
@@ -47,73 +48,86 @@ def haversine_m(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(min(1, math.sqrt(a)))
 
 
-def _kakao_headers():
-    api_key = st.secrets.get("KAKAO_API_KEY", "")
-    return {"Authorization": f"KakaoAK {api_key}"}
+# overpass-api.de 원서버가 최근 봇 트래픽 방어로 요청을 자주 튕겨내므로(406 에러),
+# 헤더를 제대로 채우고 안 되면 다른 미러 서버로 순서대로 재시도한다.
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+]
 
 
-def _kakao_category_search(category_group_code, lat, lon, radius):
-    """카카오 로컬 API - 카테고리 검색 (병원: HP8, 경찰서: PO3)"""
-    url = (
-        "https://dapi.kakao.com/v2/local/search/category.json"
-        f"?category_group_code={category_group_code}&x={lon}&y={lat}&radius={radius}&sort=distance&size=15"
-    )
-    req = urllib.request.Request(url, headers=_kakao_headers())
-    with urllib.request.urlopen(req, timeout=10) as response:
-        data = json.loads(response.read().decode())
-    return [
-        {"이름": doc["place_name"], "위도": float(doc["y"]), "경도": float(doc["x"])}
-        for doc in data.get("documents", [])
-    ]
+# overpass-api.de 원서버가 최근 봇 트래픽 방어로 요청을 자주 튕겨내므로(406/타임아웃),
+# 헤더를 제대로 채우고, 병원+경찰서+대피소를 "한 번의 요청"으로 합쳐서 왕복 횟수를 최소화한다.
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+]
+
+FACILITY_TYPES = {
+    "hospital": ('"amenity"="hospital"', "🏥"),
+    "police": ('"amenity"="police"', "🚔"),
+    "shelter": ('"emergency"="assembly_point"', "🚨"),
+}
 
 
-def _kakao_keyword_search(keyword, lat, lon, radius):
-    """카카오 로컬 API - 키워드 검색 (대피소는 전용 카테고리 코드가 없어 키워드로 조회)"""
-    from urllib.parse import quote
-    url = (
-        "https://dapi.kakao.com/v2/local/search/keyword.json"
-        f"?query={quote(keyword)}&x={lon}&y={lat}&radius={radius}&sort=distance&size=15"
-    )
-    req = urllib.request.Request(url, headers=_kakao_headers())
-    with urllib.request.urlopen(req, timeout=10) as response:
-        data = json.loads(response.read().decode())
-    return [
-        {"이름": doc["place_name"], "위도": float(doc["y"]), "경도": float(doc["x"])}
-        for doc in data.get("documents", [])
-    ]
-
-
-@st.cache_data(show_spinner=False, ttl=300)  # 실패 결과가 오래 캐싱되지 않도록 5분 TTL
+@st.cache_data(show_spinner=False)
 def find_all_nearby_facilities(lat, lon, radius=3000):
-    """병원/경찰서/대피소를 카카오 로컬 API로 조회"""
-    if not st.secrets.get("KAKAO_API_KEY"):
-        st.error("⚠️ 카카오 API 키가 설정되지 않았습니다. Streamlit Secrets에 KAKAO_API_KEY를 추가해주세요.")
-        return [], [], []
+    """병원/경찰서/대피소를 단일 Overpass 쿼리로 한 번에 조회한다."""
+    clauses = []
+    for key, (tag_filter, _) in FACILITY_TYPES.items():
+        clauses.append(f'node[{tag_filter}](around:{radius},{lat},{lon});')
+        clauses.append(f'way[{tag_filter}](around:{radius},{lat},{lon});')
 
-    hospitals, police, shelters = [], [], []
+    query = f"""
+    [out:json][timeout:15];
+    (
+      {'\n      '.join(clauses)}
+    );
+    out center tags;
+    """
+    headers = {
+        "User-Agent": "DisasterSafetyApp/1.0 (contact: streamlit-app-demo@example.com)",
+        "Accept": "application/json, */*",
+        "Accept-Encoding": "identity",
+        "Content-Type": "text/plain; charset=utf-8",
+    }
 
-    try:
-        hospitals = _kakao_category_search("HP8", lat, lon, radius)
-    except Exception as e:
-        st.error(f"병원 검색 실패 원인: {e}")
+    last_error = None
+    for url in OVERPASS_MIRRORS:
+        try:
+            req = urllib.request.Request(url, data=query.encode('utf-8'), headers=headers)
+            with urllib.request.urlopen(req, timeout=12) as response:
+                data = json.loads(response.read().decode())
 
-    try:
-        police = _kakao_category_search("PO3", lat, lon, radius)
-    except Exception as e:
-        st.error(f"경찰서 검색 실패 원인: {e}")
+            hospitals, police, shelters = [], [], []
+            for el in data.get("elements", []):
+                tags = el.get("tags", {})
+                name = tags.get("name", "이름 미상 시설")
+                if el["type"] == "node":
+                    flat, flon = el["lat"], el["lon"]
+                else:
+                    center = el.get("center")
+                    if not center:
+                        continue
+                    flat, flon = center["lat"], center["lon"]
+                item = {"이름": name, "위도": flat, "경도": flon}
 
-    try:
-        shelters = _kakao_keyword_search("대피소", lat, lon, radius)
-    except Exception as e:
-        st.error(f"대피소 검색 실패 원인: {e}")
-        
-    return hospitals, police, shelters
+                if tags.get("amenity") == "hospital":
+                    hospitals.append(item)
+                elif tags.get("amenity") == "police":
+                    police.append(item)
+                elif tags.get("emergency") == "assembly_point":
+                    shelters.append(item)
 
+            return hospitals, police, shelters  # 성공하면 즉시 반환
+        except Exception as e:
+            last_error = e
+            continue  # 이 미러가 실패하면 다음 미러로 재시도
 
-def google_maps_search_url(query, lat, lon):
-    """API 키 없이도 항상 작동하는 구글맵 검색 링크 (Overpass 실패 시 대체용)"""
-    from urllib.parse import quote
-    return f"https://www.google.com/maps/search/{quote(query)}/@{lat},{lon},16z"
+    st.warning(f"실시간 시설 조회 실패: 모든 서버 응답 실패 - {last_error}")
+    return [], [], []
 
 
 def find_closest(user_lat, user_lon, facilities):
@@ -247,7 +261,7 @@ if address:
             st.write(f"**현재 상태 추정**: {before}")
             st.write(f"**지진 시 상황 예측**: {after}")
 
-            st.subheader("🏃 주변 구호 기관 (카카오맵 데이터 기반)")
+            st.subheader("🏃 주변 구호 기관 (실제 OSM 데이터 기반)")
             with st.spinner("주변 병원/경찰서/대피소 실시간 조회 중..."):
                 hospitals, police, shelters = find_all_nearby_facilities(lat, lon)
 
@@ -260,16 +274,8 @@ if address:
             shelter_text = f"{closest_shelter['이름']} ({closest_shelter['거리']}m)" if closest_shelter else "반경 내 조회 결과 없음 (지자체 공식 자료 확인 권장)"
 
             st.write(f"🏥 응급 의료원: {hospital_text}")
-            if not closest_hospital:
-                st.caption(f"↳ 실시간 조회가 불안정할 수 있습니다. [구글맵에서 주변 병원 직접 확인]({google_maps_search_url('병원', lat, lon)})")
-
             st.write(f"🚔 치안/구조처: {police_text}")
-            if not closest_police:
-                st.caption(f"↳ 실시간 조회가 불안정할 수 있습니다. [구글맵에서 주변 경찰서 직접 확인]({google_maps_search_url('경찰서', lat, lon)})")
-
             st.write(f"🚨 지정 대피소: {shelter_text}")
-            if not closest_shelter:
-                st.caption(f"↳ [구글맵에서 주변 대피소/공터 직접 확인]({google_maps_search_url('대피소', lat, lon)})")
 
             b_color = "green" if scores["종합점수"] >= 85 else ("orange" if scores["종합점수"] >= 60 else "red")
             m = folium.Map(location=[lat, lon], zoom_start=15)
